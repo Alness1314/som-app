@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+[project]
+name = "som-backend"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = ["fastapi==0.115.6", "uvicorn[standard]==0.34.0", "pydantic==2.10.4", "SQLAlchemy==2.0.36", "alembic==1.14.0", "pandas==2.2.3", "openpyxl==3.1.5", "reportlab==4.2.5", "python-pptx==1.0.2", "APScheduler==3.10.4", "playwright==1.49.1"]
+[project.optional-dependencies]
+test = ["pytest==8.3.4", "pytest-asyncio==0.25.3", "httpx==0.28.1"]
+[tool.setuptools.packages.find]
+where = ["."]

@@ -1,0 +1,74 @@
+{
+  "name": "security-operations-manager",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Aplicación local de operaciones de ciberseguridad SOM",
+  "main": "dist-electron/main.js",
+  "scripts": {
+    "dev": "concurrently -k --success command-2 \"npm:dev:frontend\" \"npm:dev:electron\"",
+    "dev:frontend": "vite --host 127.0.0.1",
+    "dev:electron": "npm run build:electron && wait-on http://127.0.0.1:5173 && cross-env SOM_DEV=1 electron .",
+    "build:frontend": "tsc -b && vite build",
+    "build:electron": "tsc -p electron/tsconfig.json",
+    "build": "npm run build:frontend && npm run build:electron",
+    "dist": "npm run build && electron-builder --win nsis",
+    "test": "npm run build && .\\backend\\.venv\\Scripts\\python.exe -m pytest backend/tests -q"
+  },
+  "dependencies": {
+    "lucide-react": "^0.468.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^7.18.4",
+    "zustand": "^5.0.2"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.3",
+    "@types/node": "^22.10.2",
+    "@types/react": "^18.3.17",
+    "@types/react-dom": "^18.3.5",
+    "@vitejs/plugin-react": "^4.3.4",
+    "concurrently": "^9.1.2",
+    "cross-env": "^7.0.3",
+    "electron": "^44.7.2",
+    "electron-builder": "^26.15.3",
+    "tailwindcss": "^4.3.3",
+    "typescript": "~5.7.2",
+    "vite": "^6.0.5",
+    "wait-on": "^8.0.1"
+  },
+  "build": {
+    "appId": "com.som.securityoperationsmanager",
+    "productName": "Security Operations Manager",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**",
+      "dist-electron/**",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "backend/dist/som-backend.exe",
+        "to": "backend/som-backend.exe"
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "SecurityOperationsManager-Setup-${version}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    }
+  }
+}
