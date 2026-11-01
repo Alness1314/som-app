@@ -28,7 +28,7 @@ async function startBackend(){
  throw new Error('FastAPI no respondió dentro del tiempo de inicio.');
 }
 function makeWindow(){const win=new BrowserWindow({width:1440,height:920,minWidth:1000,minHeight:680,backgroundColor:'#0b1118',webPreferences:{preload:path.join(__dirname,'preload.js'),contextIsolation:true,nodeIntegration:false,sandbox:true}});win.webContents.setWindowOpenHandler(({url})=>{if(url.startsWith('https://')) void shell.openExternal(url);return {action:'deny'};});win.webContents.on('will-navigate',(e,url)=>{const allowed=app.isPackaged?url.startsWith('file://'):url.startsWith('http://127.0.0.1:5173');if(!allowed)e.preventDefault();});if(process.env.SOM_DEV)void win.loadURL('http://127.0.0.1:5173');else void win.loadFile(path.resolve('dist/index.html'));}
-const allowedApiPath=/^\/api\/(health|dashboard|checks|audit|devices(?:\/\d+(?:\/(?:check|credentials)?)?)?|backups(?:\/(?:import|manifest|\d+\/(?:contents|archives\/\d+(?:\.\d+)*|entries\/\d+(?:\.\d+)*|analysis)))?|activities|settings\/(?:storage|backup-schedule(?:\/claim)?))$/;
+const allowedApiPath=/^\/api\/(health|dashboard|checks|audit|devices(?:\/\d+(?:\/(?:check|credentials)?)?)?|backups(?:\/(?:import|manifest|\d+(?:\/(?:contents|archives\/\d+(?:\.\d+)*|entries\/\d+(?:\.\d+)*|analysis))?))?|activities|settings\/(?:storage|backup-schedule(?:\/claim)?))$/;
 async function fillSavedDeviceLogin(win:BrowserWindow,deviceId:number){
  try{
   const response=await fetch(`http://127.0.0.1:${port}/api/devices/${deviceId}/credentials/automation`,{headers:{'X-SOM-Token':token}});
@@ -176,6 +176,19 @@ async function clickConsoleTextIfPresent(win:BrowserWindow,label:string):Promise
  })()`,true) as {clicked:boolean;count:number};
  return result.clicked;
 }
+async function clickBdsConsoleText(win:BrowserWindow,label:string){
+ const result=await win.webContents.executeJavaScript(`(()=>{
+  const norm=value=>(value||'').replace(/[\\u200B-\\u200D\\uFEFF]/g,'').replace(/\\s+/g,' ').trim().toLowerCase();
+  const wanted=norm(${JSON.stringify(label)});
+  const visible=el=>{const r=el.getBoundingClientRect(),s=getComputedStyle(el);return r.width>0&&r.height>0&&s.visibility!=='hidden'&&s.display!=='none'};
+  const matches=Array.from(document.querySelectorAll('a,button,[role="tab"],[role="button"],li,span,div'))
+   .filter(el=>visible(el)&&norm(el.innerText||el.textContent)===wanted)
+   .filter(el=>!Array.from(el.children).some(child=>norm(child.innerText||child.textContent)===wanted));
+  if(matches.length!==1)return {ok:false,count:matches.length};
+  matches[0].click();return {ok:true,count:1};
+ })()`,true) as {ok:boolean;count:number};
+ if(!result.ok)throw new Error(`BDS: no se pudo activar «${label}» (coincidencias: ${result.count}).`);
+}
 async function applyWafFilterIfAvailable(win:BrowserWindow,category:string){
  if(await clickConsoleTextIfPresent(win,'Filter')){await delay(2200);await dismissConsoleDropdowns(win);return}
  // Several W620S log pages refresh as soon as the period is selected and
@@ -246,9 +259,11 @@ function waitForHillstoneDownload(win:BrowserWindow,filepath:string,allowTextFor
  const ses=win.webContents.session;
  const promise=new Promise<string>((resolve,reject)=>{
   rejectPromise=reject;
-  timeout=setTimeout(()=>{if(onDownload)ses.removeListener('will-download',onDownload!);reject(new Error('La consola no inició la descarga dentro de 120 segundos.'))},120000);
+  timeout=setTimeout(()=>{if(onDownload)ses.removeListener('will-download',onDownload!);reject(new Error('La consola no inició la descarga dentro de 180 segundos.'))},180000);
   onDownload=(_event:Electron.Event,item:Electron.DownloadItem,contents:Electron.WebContents)=>{
-   if(contents.id!==win.webContents.id)return;
+   // Hillstone sometimes starts downloads from a child WebContents or an
+   // internal frame. The listener is attached to this device's isolated
+   // session, so filtering by the top-level WebContents ID drops valid files.
    ses.removeListener('will-download',onDownload!);item.setSavePath(filepath);
    item.once('done',(_doneEvent,state)=>{
     clearTimeout(timeout);
@@ -260,6 +275,11 @@ function waitForHillstoneDownload(win:BrowserWindow,filepath:string,allowTextFor
       // WAF firmware commonly returns its selected CSV/TXT directly, while
       // other Hillstone exports arrive as ZIPs. Keep the real container type.
       const zipPath=filepath.replace(/\.download$/i,'.zip');if(filepath!==zipPath)fs.renameSync(filepath,zipPath);resolve(zipPath);return;
+     }
+     if(signature[0]===0x1f&&signature[1]===0x8b){
+      // BDS exports some log categories as a gzip-compressed tar containing
+      // the actual TXT file (for example uhg.tar.gz -> uhg.txt).
+      const tarPath=filepath.replace(/\.download$/i,'.tar.gz');if(filepath!==tarPath)fs.renameSync(filepath,tarPath);resolve(tarPath);return;
      }
      if(!allowTextFormat)throw new Error(`El archivo descargado no parece un ZIP válido (tamaño: ${stat.size} bytes; tipo: ${item.getMimeType()||'desconocido'}; firma: ${signature.subarray(0,8).toString('hex')||'vacía'}).`);
      const sampleBuffer=Buffer.alloc(Math.min(8192,stat.size));const sampleFd=fs.openSync(filepath,'r');try{fs.readSync(sampleFd,sampleBuffer,0,sampleBuffer.length,0)}finally{fs.closeSync(sampleFd)}const text=sampleBuffer.toString('utf8').replace(/^\uFEFF/,'');
@@ -284,8 +304,9 @@ async function confirmWafSavePrompt(win:BrowserWindow){
 }
 async function exportNamedFirewallFormat(win:BrowserWindow,stageDir:string,date:string,category:{label:string;key:string},format:'TXT'|'CSV',prefix='FW',confirmSavePrompt=false,dialogAlreadyOpen=false){
  if(!dialogAlreadyOpen){await clickConsoleText(win,'Export');await delay(1000)}
- const name=`${prefix}_${category.key}_${date}_${format}${prefix==='WAF'?'.download':'.zip'}`;const filepath=path.join(stageDir,name);
- const pendingDownload=waitForHillstoneDownload(win,filepath,prefix==='WAF'?format:undefined);
+ const usesDirectTextDownload=prefix==='WAF'||prefix==='BDS';
+ const name=`${prefix}_${category.key}_${date}_${format}${usesDirectTextDownload?'.download':'.zip'}`;const filepath=path.join(stageDir,name);
+ const pendingDownload=waitForHillstoneDownload(win,filepath,usesDirectTextDownload?format:undefined);
  try{
  const fixedWafCsv=prefix==='WAF'&&category.key==='WEBSECURITYLOG';
  const exportScript=`(async()=>{
@@ -430,10 +451,12 @@ async function exportFirewallFormat(win:BrowserWindow,stageDir:string,date:strin
  if(namedDialogCategories.includes(category.key))return exportNamedFirewallFormat(win,stageDir,date,category,format,'FW',false,dialogAlreadyOpen);
  return exportQuickFirewallFormat(win,stageDir,date,category,format,'FW',dialogAlreadyOpen);
 }
-async function exportPreferredFirewallFormat(win:BrowserWindow,stageDir:string,date:string,category:{label:string;key:string},prefix:'FW'|'WAF',confirmSavePrompt=false):Promise<{path:string;format:'TXT'|'CSV'}>{
+async function exportPreferredFirewallFormat(win:BrowserWindow,stageDir:string,date:string,category:{label:string;key:string},prefix:'FW'|'WAF'|'BDS',confirmSavePrompt=false):Promise<{path:string;format:'TXT'|'CSV'}>{
  const exportFormat=(format:'TXT'|'CSV',dialogAlreadyOpen=false)=>prefix==='WAF'
   ?exportNamedFirewallFormat(win,stageDir,date,category,format,'WAF',confirmSavePrompt,dialogAlreadyOpen)
-  :exportFirewallFormat(win,stageDir,date,category,format,dialogAlreadyOpen);
+  :prefix==='BDS'
+   ?exportNamedFirewallFormat(win,stageDir,date,category,format,'BDS',confirmSavePrompt,dialogAlreadyOpen)
+   :exportFirewallFormat(win,stageDir,date,category,format,dialogAlreadyOpen);
  try{return {path:await exportFormat('TXT'),format:'TXT'}}catch(error){
   const message=error instanceof Error?error.message:String(error);
   if(!/no se encontr[oó] (?:el formato|la opci[oó]n) TXT/i.test(message))throw error;
@@ -626,6 +649,102 @@ async function runWafBackup(deviceId:number):Promise<{filename:string;file_count
   fs.rmSync(stageDir,{recursive:true,force:true});notify('Respaldo WAF completado.');return {filename:payload.backup.filename,file_count:payload.file_count??files.length,path:payload.path??''};
  }catch(error){fs.rmSync(stageDir,{recursive:true,force:true});notify('Respaldo WAF detenido; revisa el mensaje de error.');throw error}
 }
+const bdsLogCategories=[
+ {label:'Threat Log',key:'THREATLOG'},
+ {label:'Event Log',key:'EVENTLOG'},
+ {label:'Network Log',key:'NETWORKLOG'},
+ {label:'Configuration Log',key:'CONFIGURATIONLOG'},
+ {label:'Session Log',key:'SESSIONLOG'}
+] as const;
+async function selectBdsLast24Hours(win:BrowserWindow,category:string){
+ const state=await win.webContents.executeJavaScript(`(()=>{
+  const norm=value=>(value||'').replace(/[\\u200B-\\u200D\\uFEFF]/g,'').replace(/\\s+/g,' ').trim();
+  const visible=el=>{const r=el.getBoundingClientRect(),s=getComputedStyle(el);return r.width>0&&r.height>0&&s.visibility!=='hidden'&&s.display!=='none'};
+  // I1870 renders Detection Period as an ExtJS DateTimeSelector. Its generated
+  // number changes, but the input id prefix/suffix and its value are stable.
+  const periodInputs=Array.from(document.querySelectorAll('input[id^="datetimeselector-"][id$="-inputEl"]'));
+  const periodInput=periodInputs.find(el=>visible(el)&&norm(el.value))||periodInputs.find(el=>norm(el.value));
+  const selects=Array.from(document.querySelectorAll('select')).filter(visible);
+  const periodSelect=selects.find(el=>Array.from(el.options).some(option=>/last\\s*24\\s*hours/i.test(option.text)));
+  const fields=Array.from(document.querySelectorAll('input,button,[role="combobox"],[aria-haspopup="listbox"],.x-form-field')).filter(visible).map(el=>norm(el.value||el.innerText||el.getAttribute('aria-label')));
+  const text=Array.from(document.querySelectorAll('body *')).filter(el=>visible(el)&&!Array.from(el.children).some(child=>norm(child.innerText||child.textContent)===norm(el.innerText||el.textContent))).map(el=>norm(el.innerText||el.textContent)).filter(value=>/^last\\s*24\\s*hours$/i.test(value));
+  const body=norm(document.body?.innerText||'');
+  const labeledPeriod=body.match(/detection\\s*period\\s*(last\\s*24\\s*hours|last\\s*\\d+\\s*(?:minutes?|hours?|days?)|today)/i)?.[1]||'';
+  return {input:periodInput?{id:periodInput.id,value:norm(periodInput.value),visible:visible(periodInput)}:null,select:periodSelect?{value:norm(periodSelect.options[periodSelect.selectedIndex]?.text),option:periodSelect.options[periodSelect.selectedIndex]?.value||''}:null,fields,text,labeledPeriod};
+ })()`,true) as {input:{id:string;value:string;visible:boolean}|null;select:{value:string;option:string}|null;fields:string[];text:string[];labeledPeriod:string};
+ let current=state.input?.value||state.select?.value||state.fields.find(value=>/^last\\s*\\d+\\s*(minutes?|hours?|days?)|today$/i.test(value))||state.text[0]||state.labeledPeriod||'';
+ if(!/last\\s*24\\s*hours/i.test(current)){
+  if(state.select){
+   const changed=await win.webContents.executeJavaScript(`(()=>{const visible=el=>{const r=el.getBoundingClientRect();return r.width>0&&r.height>0};const select=Array.from(document.querySelectorAll('select')).find(el=>visible(el)&&Array.from(el.options).some(option=>/last\\s*24\\s*hours/i.test(option.text)));if(!select)return false;const option=Array.from(select.options).find(item=>/last\\s*24\\s*hours/i.test(item.text));const setter=Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value').set;setter.call(select,option.value);select.dispatchEvent(new Event('input',{bubbles:true}));select.dispatchEvent(new Event('change',{bubbles:true}));return true})()`,true) as boolean;
+   if(!changed)throw new Error(`BDS ${category}: no pude elegir Last 24 Hours.`);
+  }else{
+   if(state.input?.id){const opened=await win.webContents.executeJavaScript(`(()=>{const input=document.getElementById(${JSON.stringify(state.input.id)});if(!input)return false;input.click();return true})()`,true) as boolean;if(!opened)throw new Error(`BDS ${category}: no pude abrir el control de periodo ${state.input.id}.`)}
+   else if(current){if(!await clickConsoleTextIfPresent(win,current))throw new Error(`BDS ${category}: no pude abrir el periodo «${current}».`)}
+   else throw new Error(`BDS ${category}: no pude leer el campo Detection Period; la página visible dice «${state.labeledPeriod||'sin valor reconocido'}».`);
+   await delay(250);
+   // ExtJS renders options as bound-list rows, not buttons/menu items, so use
+   // the BDS text matcher which also resolves visible span/div option rows.
+   try{await clickBdsConsoleText(win,'Last 24 Hours')}catch{throw new Error(`BDS ${category}: el desplegable no mostró Last 24 Hours.`)}
+  }
+ }
+ await delay(350);
+ if(await clickConsoleTextIfPresent(win,'Filter'))await delay(1800);else await delay(1200);
+ await dismissConsoleDropdowns(win);
+ const confirmed=await win.webContents.executeJavaScript(`(()=>{const norm=value=>(value||'').replace(/[\\u200B-\\u200D\\uFEFF]/g,'').replace(/\\s+/g,' ').trim();const visible=el=>{const r=el.getBoundingClientRect(),s=getComputedStyle(el);return r.width>0&&r.height>0&&s.visibility!=='hidden'&&s.display!=='none'};const periodInputs=Array.from(document.querySelectorAll('input[id^="datetimeselector-"][id$="-inputEl"]'));const periodInput=periodInputs.find(el=>visible(el)&&norm(el.value))||periodInputs.find(el=>norm(el.value));const select=Array.from(document.querySelectorAll('select')).find(visible);const fields=Array.from(document.querySelectorAll('input,button,[role="combobox"],.x-form-field')).filter(visible).map(el=>norm(el.value||el.innerText||''));const body=norm(document.body?.innerText||'');return /^last\\s*24\\s*hours$/i.test(periodInput?.value||'')||/last\\s*24\\s*hours/i.test(select?.options[select.selectedIndex]?.text||'')||fields.some(value=>/^last\\s*24\\s*hours$/i.test(value))||Array.from(document.querySelectorAll('body *')).some(el=>visible(el)&&/^last\\s*24\\s*hours$/i.test(norm(el.innerText)))||/detection\\s*period\\s*last\\s*24\\s*hours/i.test(body)})()`,true) as boolean;
+ if(!confirmed)throw new Error(`BDS ${category}: no pude confirmar Last 24 Hours.`);
+}
+async function exportBdsSessionLog(win:BrowserWindow,stageDir:string,date:string,category:{label:string;key:string}){
+ await clickConsoleText(win,'Export');
+ const filepath=path.join(stageDir,`BDS_${category.key}_${date}.download`);
+ const pendingDownload=waitForHillstoneDownload(win,filepath,'TXT');
+ try{
+  let dialogReady=false;
+  for(let attempt=0;attempt<40;attempt++){
+   dialogReady=await win.webContents.executeJavaScript(`(()=>{const visible=el=>{const r=el.getBoundingClientRect(),s=getComputedStyle(el);return r.width>0&&r.height>0&&s.visibility!=='hidden'&&s.display!=='none'};const norm=value=>(value||'').replace(/\\s+/g,' ').trim().toLowerCase();const roots=Array.from(document.querySelectorAll('[role="dialog"],.x-window,.x-panel,[id*="export"]')).filter(visible).filter(root=>/export/.test(norm(root.innerText)));return roots.some(root=>/separator/.test(norm(root.innerText))&&Array.from(root.querySelectorAll('button,a,[role="button"],.x-btn')).some(button=>visible(button)&&norm(button.innerText||button.value)==='ok'))})()`,true).catch(()=>false);
+   if(dialogReady)break;await delay(250);
+  }
+  if(!dialogReady)throw new Error('BDS Session Log: no apareció el diálogo Export con el campo Separator.');
+  const configured=await win.webContents.executeJavaScript(`(()=>{const visible=el=>{const r=el.getBoundingClientRect(),s=getComputedStyle(el);return r.width>0&&r.height>0&&s.visibility!=='hidden'&&s.display!=='none'};const norm=value=>(value||'').replace(/\\s+/g,' ').trim().toLowerCase();const buttons='button,a,[role="button"],input[type="button"],input[type="submit"],.x-btn';const leaves=(root,label)=>Array.from(root.querySelectorAll('*')).filter(el=>visible(el)&&norm(el.innerText||el.textContent)===label&&!Array.from(el.children).some(child=>norm(child.innerText||child.textContent)===label));const roots=Array.from(document.querySelectorAll('[role="dialog"],.x-window,.x-panel,[id*="export"]')).filter(visible).filter(root=>/export/.test(norm(root.innerText))&&/separator/.test(norm(root.innerText)));const matches=roots.filter(root=>Array.from(root.querySelectorAll(buttons)).some(button=>visible(button)&&norm(button.innerText||button.value)==='ok'));if(!matches.length)return {ok:false,error:'no encontré el panel Export'};matches.sort((a,b)=>{const ar=a.getBoundingClientRect(),br=b.getBoundingClientRect();return ar.width*ar.height-br.width*br.height});const root=matches[0];const labels=leaves(root,'separator');let field=null;for(const label of labels){let parent=label;while(parent&&parent!==root){const inputs=Array.from(parent.querySelectorAll('input:not([type="hidden"]),textarea,[role="textbox"]')).filter(input=>visible(input)&&!input.disabled&&!input.readOnly);if(inputs.length===1){field=inputs[0];break}parent=parent.parentElement}if(field)break}if(!field){const inputs=Array.from(root.querySelectorAll('input:not([type="hidden"]),textarea,[role="textbox"]')).filter(input=>visible(input)&&!input.disabled&&!input.readOnly);if(inputs.length===1)field=inputs[0]}if(!field)return {ok:false,error:'no encontré el campo Separator'};const value='';const setter=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value')?.set;if(setter)setter.call(field,value);else field.value=value;field.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'deleteContent'}));field.dispatchEvent(new Event('change',{bubbles:true}));const componentId=field.id?.replace(/-inputEl$/,'');const component=window.Ext?.getCmp?.(componentId)||null;if(component?.setValue){component.setValue(value);component.setRawValue?.(value)}if(field.value!==value&&component?.getValue?.()!==value)return {ok:false,error:'no quedó vacío Separator'};const ok=Array.from(root.querySelectorAll(buttons)).filter(button=>visible(button)&&norm(button.innerText||button.value)==='ok');if(!ok.length)return {ok:false,error:'no encontré el botón OK'};ok[0].click();return {ok:true}})()`,true) as {ok:boolean;error?:string};
+  if(!configured.ok)throw new Error(`BDS Session Log: ${configured.error||'no pude configurar Separator.'}`);
+  await confirmWafSavePrompt(win);
+  return await pendingDownload.promise;
+ }catch(error){pendingDownload.cancel();await pendingDownload.promise.catch(()=>{});throw error}
+}
+async function runBdsBackup(deviceId:number):Promise<{filename:string;file_count:number;path:string}>{
+ const win=await openDeviceConsole(deviceId);if(win.isDestroyed())throw new Error('La ventana de la consola se cerró.');if(win.isMinimized())win.restore();win.maximize();win.show();win.focus();await delay(350);
+ const notify=(message:string)=>{for(const appWindow of BrowserWindow.getAllWindows())if(!appWindow.isDestroyed())appWindow.webContents.send('som:backup-progress',message)};
+ notify('Esperando a que Hillstone BDS termine de iniciar sesión…');
+ let loggedIn=false;
+ for(let attempt=0;attempt<40;attempt++){
+  if(win.isDestroyed())throw new Error('La ventana de la consola se cerró.');
+  const state=await win.webContents.executeJavaScript(`(()=>{const visible=el=>{const r=el.getBoundingClientRect();return r.width>0&&r.height>0&&getComputedStyle(el).visibility!=='hidden'};return {loaded:document.readyState!=='loading'&&!!document.body,login:Array.from(document.querySelectorAll('input[type="password"]')).some(visible)}})()`,true) as {loaded:boolean;login:boolean};
+  if(state.loaded&&!state.login){loggedIn=true;break}await delay(750);
+ }
+ if(!loggedIn)throw new Error('No pude confirmar la sesión del I1870. Inicia sesión en la ventana Hillstone y vuelve a intentar.');
+ const stageDir=path.join(runtimeDataDir,'automation-staging',randomBytes(12).toString('hex'));fs.mkdirSync(stageDir,{recursive:true});
+ const now=new Date();const date=`${String(now.getDate()).padStart(2,'0')}_${String(now.getMonth()+1).padStart(2,'0')}_${now.getFullYear()}`;const files:Array<{path:string;category:string;format:string}>=[];
+ try{
+  notify('Abriendo Log & Report en el I1870…');await clickBdsConsoleText(win,'Log & Report');await delay(1200);
+  for(let index=0;index<bdsLogCategories.length;index++){
+   const category=bdsLogCategories[index];notify(`Consultando BDS · ${category.label} (${index+1}/${bdsLogCategories.length})`);await dismissConsoleDropdowns(win);await clickBdsConsoleText(win,category.label);await delay(1800);await dismissConsoleDropdowns(win);
+   if(category.key!=='SESSIONLOG')await selectBdsLast24Hours(win,category.label);
+   const rows=await detectLogRows(win);
+   if(rows==='unknown')throw new Error(`BDS ${category.label}: no pude confirmar si hay registros; se detuvo sin marcarlo como vacío.`);
+   if(rows==='empty'){
+    const evidencePath=path.join(stageDir,`BDS_${category.key}_${date}_SIN_LOGS.png`);const image=await win.webContents.capturePage();fs.writeFileSync(evidencePath,image.toPNG());files.push({path:evidencePath,category:category.key,format:'PNG'});continue;
+   }
+   if(category.key==='SESSIONLOG'){
+    notify('Exportando BDS · Session Log…');const file=await exportBdsSessionLog(win,stageDir,date,category);files.push({path:file,category:category.key,format:path.extname(file).toLowerCase()==='.zip'?'ZIP':path.extname(file).toLowerCase()==='.txt'?'TXT':'CSV'});
+   }else{
+    notify(`Exportando BDS · ${category.label} · TXT preferido (CSV alternativo)…`);const exported=await exportPreferredFirewallFormat(win,stageDir,date,category,'BDS',true);const exportedPath=exported.path.toLowerCase();files.push({path:exported.path,category:category.key,format:exportedPath.endsWith('.tar.gz')?'TAR_GZ':path.extname(exported.path).toLowerCase()==='.zip'?'ZIP':exported.format});await delay(1200);
+   }
+  }
+  notify('Verificando y empaquetando el respaldo BDS…');
+  const response=await fetch(`http://127.0.0.1:${port}/api/backups/internal/firewall-bundle`,{method:'POST',headers:{'X-SOM-Token':token,'Content-Type':'application/json'},body:JSON.stringify({device_id:deviceId,report_date:date,files})});
+  const payload=await response.json() as {detail?:string;backup?:{filename:string};file_count?:number;path?:string};if(!response.ok||!payload.backup)throw new Error(payload.detail||'No se pudo registrar el respaldo BDS.');
+  fs.rmSync(stageDir,{recursive:true,force:true});notify('Respaldo BDS completado.');return {filename:payload.backup.filename,file_count:payload.file_count??files.length,path:payload.path??''};
+ }catch(error){fs.rmSync(stageDir,{recursive:true,force:true});notify('Respaldo BDS detenido; revisa el mensaje de error.');throw error}
+}
 ipcMain.handle('som:run-firewall-backup',async(_event,deviceId:number)=>{
  if(!Number.isSafeInteger(deviceId)||deviceId<1)throw new Error('Identificador de dispositivo inválido');
  if(firewallBackupRuns.has(deviceId))throw new Error('Ya hay una ejecución de respaldo activa para este firewall.');
@@ -647,45 +766,120 @@ ipcMain.handle('som:run-waf-backup',async(_event,deviceId:number)=>{
   return await runWafBackup(deviceId);
  }finally{firewallBackupRuns.delete(deviceId)}
 });
-let backupScheduleTimer:NodeJS.Timeout|undefined;
-let scheduleTickRunning=false;
+ipcMain.handle('som:run-bds-backup',async(_event,deviceId:number)=>{
+ if(!Number.isSafeInteger(deviceId)||deviceId<1)throw new Error('Identificador de dispositivo inválido');
+ if(firewallBackupRuns.has(deviceId))throw new Error('Ya hay un respaldo activo para este dispositivo.');firewallBackupRuns.add(deviceId);
+ try{
+  const response=await fetch(`http://127.0.0.1:${port}/api/devices`,{headers:{'X-SOM-Token':token}});if(!response.ok)throw new Error('No se pudieron cargar los dispositivos configurados');
+  const devices=await response.json() as Array<{id:number;kind:string}>;const device=devices.find(item=>item.id===deviceId);if(!device||device.kind!=='BDS')throw new Error('Selecciona el BDS I1870 para iniciar este respaldo.');
+  return await runBdsBackup(deviceId);
+ }finally{firewallBackupRuns.delete(deviceId)}
+});
+type BackupScheduleKind='FIREWALL'|'WAF'|'BDS';
+const backupScheduleTimers=new Map<BackupScheduleKind,NodeJS.Timeout>();
+const scheduledBackupQueue=new Set<BackupScheduleKind>();
+let scheduledBackupQueueRunning=false;
+const backupScheduleOrder:BackupScheduleKind[]=['FIREWALL','WAF','BDS'];
 async function scheduleApi(route:string,method='GET',body?:unknown){
  const response=await fetch(`http://127.0.0.1:${port}${route}`,{method,headers:{'X-SOM-Token':token,...(body?{'Content-Type':'application/json'}:{})},...(body?{body:JSON.stringify(body)}:{})});
  if(!response.ok)throw new Error(`HTTP ${response.status} al consultar la programación`);
  return await response.json() as any;
 }
-async function runScheduledFirewallBackup(){
- if(scheduleTickRunning)return;scheduleTickRunning=true;
+function localScheduleDate(date:Date){return `${date.getFullYear()}-${String(date.getMonth()+1).padStart(2,'0')}-${String(date.getDate()).padStart(2,'0')}`}
+function notifyScheduledBackup(message:string){for(const window of BrowserWindow.getAllWindows())if(!window.isDestroyed())window.webContents.send('som:backup-progress',message)}
+async function runOneScheduledBackup(kind:BackupScheduleKind){
+ const schedule=await scheduleApi('/api/settings/backup-schedule') as {jobs:Array<{kind:BackupScheduleKind;enabled:boolean;time:string;device_id:number|null;device_name:string|null;last_run_date:string|null;last_attempt_date:string|null}>};
+ const now=new Date();const date=localScheduleDate(now);
+ const currentTime=`${String(now.getHours()).padStart(2,'0')}:${String(now.getMinutes()).padStart(2,'0')}`;
+ const job=schedule.jobs.find(candidate=>candidate.kind===kind);
+ if(!job?.enabled||job.last_run_date===date||currentTime<job.time)return 'idle' as const;
+ // Keep each device's schedule/claim independent, but start due work in a
+ // deterministic Firewall → WAF → BDS order. A failed predecessor counts as
+ // attempted for sequencing; its own timer can retry it after the backoff.
+ for(const earlierKind of backupScheduleOrder.slice(0,backupScheduleOrder.indexOf(kind))){
+  const earlier=schedule.jobs.find(candidate=>candidate.kind===earlierKind);
+  if(!earlier?.enabled||earlier.last_run_date===date||earlier.last_attempt_date===date)continue;
+  if(currentTime<earlier.time)return 'waiting' as const;
+  // Do not recurse into the predecessor: enqueue it as its own scheduled job
+  // so failures and timeouts are isolated and the drain always resumes in order.
+  scheduledBackupQueue.add(earlierKind);
+  return 'waiting' as const;
+ }
+ if(job.device_id&&firewallBackupRuns.has(job.device_id))return 'waiting' as const;
+ const claim=await scheduleApi('/api/settings/backup-schedule/claim','POST',{kind,run_date:date}) as {claimed:boolean;reason?:string};
+ if(!claim.claimed)return claim.reason==='retry-backoff'?'backoff' as const:claim.reason==='already-completed'?'idle' as const:'waiting' as const;
+ // Treat stale/missing device configuration as a failed attempt, not an idle
+ // job. Otherwise the next task waits forever for this predecessor's attempt.
+ if(!job.device_id){
+  const message=`Respaldo ${kind}: falta seleccionar un dispositivo habilitado.`;
+  try{await scheduleApi('/api/settings/backup-schedule/finish','POST',{kind,run_date:date,success:false,message})}
+  catch(error){console.error(`[SOM] No se pudo registrar el fallo de configuración ${kind}: ${error instanceof Error?error.message:String(error)}`)}
+  notifyScheduledBackup(`${message} Se registra el fallo y continúa la siguiente tarea.`);
+  return 'failed' as const;
+ }
+ firewallBackupRuns.add(job.device_id);
  try{
-  const schedule=await scheduleApi('/api/settings/backup-schedule') as {enabled:boolean;time:string;device_id:number;last_run_date:string|null};
-  if(!schedule.enabled)return;
-  const now=new Date();const date=`${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${String(now.getDate()).padStart(2,'0')}`;
-  const currentTime=`${String(now.getHours()).padStart(2,'0')}:${String(now.getMinutes()).padStart(2,'0')}`;
-  if(currentTime<schedule.time||schedule.last_run_date===date)return;
-  if(firewallBackupRuns.has(schedule.device_id))return;
-  const claim=await scheduleApi('/api/settings/backup-schedule/claim','POST',{run_date:date}) as {claimed:boolean};
-  if(!claim.claimed)return;
-  const notify=(message:string)=>{for(const window of BrowserWindow.getAllWindows())if(!window.isDestroyed())window.webContents.send('som:backup-progress',message)};
-  if(firewallBackupRuns.has(schedule.device_id))throw new Error('Ya hay un respaldo manual activo para el firewall programado.');
-  firewallBackupRuns.add(schedule.device_id);
+  notifyScheduledBackup(`Respaldo ${kind} programado iniciado a las ${job.time} (hora local de esta PC)…`);
+  const run=kind==='WAF'?runWafBackup:kind==='BDS'?runBdsBackup:runFirewallBackup;
+  const result=await run(job.device_id);
   try{
-   notify(`Respaldo programado iniciado a las ${schedule.time}…`);
-   const result=await runFirewallBackup(schedule.device_id);
-   notify(`Respaldo programado completado: ${result.filename}`);
-   console.info(`[SOM] Respaldo automático completado: ${result.path}`);
-  }finally{firewallBackupRuns.delete(schedule.device_id)}
+   await scheduleApi('/api/settings/backup-schedule/finish','POST',{kind,run_date:date,success:true,message:result.filename});
+   notifyScheduledBackup(`Respaldo ${kind} completado y guardado como tarea independiente: ${result.filename}`);
+   console.info(`[SOM] Respaldo automático ${kind} completado y guardado: ${result.path}`);
+  }catch(error){
+   const message=error instanceof Error?error.message:String(error);
+   console.error(`[SOM] Respaldo ${kind} quedó guardado (${result.path}), pero no se pudo actualizar su estado programado: ${message}`);
+   notifyScheduledBackup(`Respaldo ${kind} guardado (${result.filename}), pero no se actualizó el estado del horario. Las demás tareas continúan.`);
+  }
+  return 'completed' as const;
  }catch(error){
   const message=error instanceof Error?error.message:String(error);
-  console.error(`[SOM] Falló el respaldo programado: ${message}`);
-  for(const window of BrowserWindow.getAllWindows())if(!window.isDestroyed())window.webContents.send('som:backup-progress',`Falló el respaldo programado: ${message}`);
- }finally{scheduleTickRunning=false}
+  console.error(`[SOM] Falló respaldo automático ${kind}: ${message}`);
+  try{await scheduleApi('/api/settings/backup-schedule/finish','POST',{kind,run_date:date,success:false,message})}
+  catch(finishError){console.error(`[SOM] No se pudo liberar el trabajo ${kind}: ${finishError instanceof Error?finishError.message:String(finishError)}`)}
+  notifyScheduledBackup(`Falló respaldo ${kind}: ${message}. Quedó registrado; continúa la siguiente tarea y se reintentará en 5 minutos.`);
+  return 'failed' as const;
+ }finally{firewallBackupRuns.delete(job.device_id)}
 }
+async function drainScheduledBackupQueue(){
+ if(scheduledBackupQueueRunning)return;
+ scheduledBackupQueueRunning=true;
+ try{
+  while(scheduledBackupQueue.size){
+   const kind=backupScheduleOrder.find(candidate=>scheduledBackupQueue.has(candidate));
+   if(!kind)break;
+   scheduledBackupQueue.delete(kind);
+   let outcome:'idle'|'waiting'|'backoff'|'completed'|'failed'|'error';
+   try{outcome=await runOneScheduledBackup(kind)}
+   catch(error){
+    const message=error instanceof Error?error.message:String(error);
+    console.error(`[SOM] Error aislado en el trabajo programado ${kind}: ${message}`);
+    notifyScheduledBackup(`No se pudo revisar o iniciar el respaldo ${kind}: ${message}. Se volverá a revisar en el siguiente ciclo.`);
+    outcome='error';
+   }
+   if(outcome==='completed'||outcome==='failed'){
+    // Re-read state after each distinct task, then run the next due job.
+    for(const next of backupScheduleOrder)scheduledBackupQueue.add(next);
+   }
+  }
+ }catch(error){
+  const message=error instanceof Error?error.message:String(error);
+  console.error(`[SOM] Falló la cola de respaldos programados: ${message}`);
+  notifyScheduledBackup(`Falló la programación de respaldos: ${message}`);
+ }finally{scheduledBackupQueueRunning=false}
+}
+function enqueueScheduledBackup(kind:BackupScheduleKind){scheduledBackupQueue.add(kind);void drainScheduledBackupQueue()}
 function startBackupSchedule(){
- if(backupScheduleTimer)clearInterval(backupScheduleTimer);
- backupScheduleTimer=setInterval(()=>void runScheduledFirewallBackup(),20000);
- void runScheduledFirewallBackup();
+ for(const timer of backupScheduleTimers.values())clearInterval(timer);
+ backupScheduleTimers.clear();
+ // Three independent clock ticks and persisted claims feed a serial queue.
+ // Each queued item has its own backup call, success/failure audit, and bundle.
+ for(const kind of ['FIREWALL','WAF','BDS'] as const){
+  backupScheduleTimers.set(kind,setInterval(()=>enqueueScheduledBackup(kind),20000));
+ }
+ for(const kind of backupScheduleOrder)enqueueScheduledBackup(kind);
 }
 ipcMain.handle('som:open-sophos-policies',async()=>{await shell.openExternal('https://fusion.sophos.com/manage/endpoint/policies/list');});
 app.whenReady().then(async()=>{try{await startBackend();makeWindow();startBackupSchedule()}catch(error){const message=error instanceof Error?`${error.message}${error.stack?`\n${error.stack}`:''}`:String(error);console.error(`[SOM] Error durante el arranque: ${message}`);dialog.showErrorBox('No se pudo iniciar SOM',message);app.exit(1)}});
-app.on('before-quit',()=>{if(backupScheduleTimer)clearInterval(backupScheduleTimer);if(backend&&!backend.killed)backend.kill();});
+app.on('before-quit',()=>{for(const timer of backupScheduleTimers.values())clearInterval(timer);backupScheduleTimers.clear();if(backend&&!backend.killed)backend.kill();});
 app.on('window-all-closed',()=>{if(process.platform!=='darwin')app.quit();});

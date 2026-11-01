@@ -12,6 +12,7 @@ contextBridge.exposeInMainWorld('som',{
  openDeviceConsole:(deviceId:number)=>ipcRenderer.invoke('som:open-device-console',deviceId),
  runFirewallBackup:(deviceId:number)=>ipcRenderer.invoke('som:run-firewall-backup',deviceId),
  runWafBackup:(deviceId:number)=>ipcRenderer.invoke('som:run-waf-backup',deviceId),
+ runBdsBackup:(deviceId:number)=>ipcRenderer.invoke('som:run-bds-backup',deviceId),
  onBackupProgress:(callback:(message:string)=>void)=>{const listener=(_event:Electron.IpcRendererEvent,message:string)=>callback(message);ipcRenderer.on('som:backup-progress',listener);return()=>ipcRenderer.removeListener('som:backup-progress',listener)},
  openSophosPolicies:()=>ipcRenderer.invoke('som:open-sophos-policies'),
  selectFiles:()=>ipcRenderer.invoke('som:select-files'),

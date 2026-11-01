@@ -26,18 +26,38 @@ class StorageSettingIn(BaseModel):
     destination_type: str = Field(pattern="^(local|nas|cloud_sync)$")
     path: str = Field(min_length=1, max_length=1024)
 
-class BackupScheduleIn(BaseModel):
+class BackupScheduleJobIn(BaseModel):
+    kind: str = Field(pattern="^(FIREWALL|WAF|BDS)$")
     enabled: bool = False
     time: str = Field(pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
     device_id: int = Field(gt=0)
 
+class BackupScheduleIn(BaseModel):
+    jobs: list[BackupScheduleJobIn] = Field(min_length=3, max_length=3)
+
+class BackupDeleteIn(BaseModel):
+    reason: str = Field(min_length=3, max_length=500)
+
+    @field_validator("reason")
+    @classmethod
+    def reason_must_not_be_blank(cls, value: str) -> str:
+        value = value.strip()
+        if len(value) < 3:
+            raise ValueError("El motivo debe tener al menos 3 caracteres")
+        return value
+
 class BackupScheduleClaimIn(BaseModel):
+    kind: str = Field(pattern="^(FIREWALL|WAF|BDS)$")
     run_date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+
+class BackupScheduleFinishIn(BackupScheduleClaimIn):
+    success: bool
+    message: str | None = Field(default=None, max_length=2000)
 
 class BackupBundleItemIn(BaseModel):
     path: str = Field(min_length=1, max_length=2048)
     category: str = Field(pattern="^(EVENTLOG|NETWORKLOG|CONFIGURATIONLOG|THREATLOG|SESSIONLOG|NATLOG|URLLOG|WEBACCESSLOG|NETWORKSECURITYLOG|WEBSECURITYLOG)$")
-    format: str = Field(pattern="^(TXT|CSV|ZIP|PNG)$")
+    format: str = Field(pattern="^(TXT|CSV|ZIP|TAR_GZ|PNG)$")
 
 class BackupBundleIn(BaseModel):
     device_id: int = Field(gt=0)

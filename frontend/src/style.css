@@ -57,6 +57,11 @@
 :root[data-theme='light'] .empty-state h2{color:#243447}
 :root[data-theme='light'] .empty-state p{color:#6b7b90}
 
+.button.danger{background:#3a2025;border-color:#69343b;color:#ffaaa6}.button.danger:hover{background:#51262d;border-color:#85414a;color:#ffd0cd}
+:root[data-theme='light'] .button.danger{background:#fff1f0;border-color:#f0b7b3;color:#a52e2a}:root[data-theme='light'] .button.danger:hover{background:#ffe2e0;border-color:#e99a95;color:#7f1d1d}
+.modal .form-input{width:100%;min-height:37px;border:1px solid #2b3948;border-radius:6px;background:#0d151d;color:#dce6ef;padding:9px 10px;outline:0;resize:vertical}.modal .form-input:focus{border-color:#39c992}
+:root[data-theme='light'] .modal .form-input{background:#fff;border-color:#d6dfe8;color:#263445}
+
 .integration-link{border:0;background:transparent;width:100%;font:inherit;text-align:left}
 .modal label.tls-confirm{flex-direction:row;align-items:flex-start;gap:9px;line-height:1.5}.modal label.tls-confirm input[type=checkbox]{width:16px;min-width:16px;height:16px;padding:0;margin-top:2px;accent-color:#16a37c}
 .settings-card .form-label{display:grid;gap:7px;color:#9babb9;font-size:11px}.settings-card .form-input{height:37px;min-width:0;border:1px solid #2b3948;border-radius:6px;background:#0d151d;color:#dce6ef;padding:0 10px;outline:0}.settings-card .form-input:focus{border-color:#39c992}.settings-card .form-input option{background:#0d151d;color:#dce6ef}
